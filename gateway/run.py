@@ -14133,8 +14133,11 @@ class GatewayRunner:
         _NOTIFY_INTERVAL_RAW = _float_env("HERMES_AGENT_NOTIFY_INTERVAL", 180)
         _NOTIFY_INTERVAL = _NOTIFY_INTERVAL_RAW if _NOTIFY_INTERVAL_RAW > 0 else None
         _notify_start = time.time()
+        _auto_linear_attempted = False
+        _auto_linear_link = None
 
         async def _notify_long_running():
+            nonlocal _auto_linear_attempted, _auto_linear_link
             if _NOTIFY_INTERVAL is None:
                 return  # Notifications disabled (gateway_notify_interval: 0)
             _notify_adapter = self.adapters.get(source.platform)
@@ -14151,16 +14154,55 @@ class GatewayRunner:
                         _a = _agent_ref.get_activity_summary()
                         _parts = [f"iteration {_a['api_call_count']}/{_a['max_iterations']}"]
                         if _a.get("current_tool"):
-                            _parts.append(f"running: {_a['current_tool']}")
+                            _parts.append(f"tool: {_a['current_tool']}")
                         else:
-                            _parts.append(_a.get("last_activity_desc", ""))
-                        _status_detail = " — " + ", ".join(_parts)
+                            desc = _a.get("last_activity_desc") or "waiting on model/tool result"
+                            _parts.append(str(desc))
+                        idle = int(float(_a.get("seconds_since_activity") or 0))
+                        if idle >= 10:
+                            _parts.append(f"idle {idle}s")
+                        _status_detail = " — " + ", ".join(p for p in _parts if p)
                     except Exception:
                         pass
+
+                _linear_detail = ""
+                if session_key and not _auto_linear_attempted:
+                    _auto_linear_attempted = True
+                    try:
+                        from gateway.linear_activity import auto_create_issue_for_session, safe_error
+
+                        _source_meta = {
+                            "platform": str(getattr(source.platform, "value", source.platform)),
+                            "chat_id": str(getattr(source, "chat_id", "") or ""),
+                            "thread_id": str(getattr(source, "thread_id", "") or ""),
+                        }
+                        _auto_linear_link = auto_create_issue_for_session(
+                            session_key,
+                            message,
+                            source=_source_meta,
+                        )
+                        if _auto_linear_link:
+                            _linear_detail = f" · Linear `{_auto_linear_link.get('identifier')}`"
+                    except Exception as _lin_exc:
+                        try:
+                            _linear_detail = f" · Linear link failed: {safe_error(_lin_exc)}"
+                        except Exception:
+                            _linear_detail = " · Linear link failed"
+                elif _auto_linear_link:
+                    _linear_detail = f" · Linear `{_auto_linear_link.get('identifier')}`"
+                else:
+                    try:
+                        from gateway.linear_activity import get_session_link
+                        _attached = get_session_link(session_key) if session_key else None
+                        if _attached:
+                            _linear_detail = f" · Linear `{_attached.get('identifier')}`"
+                    except Exception:
+                        pass
+
                 try:
                     await _notify_adapter.send(
                         source.chat_id,
-                        f"⏳ Still working... ({_elapsed_mins} min elapsed{_status_detail})",
+                        f"⏳ Still working ({_elapsed_mins} min{_linear_detail}){_status_detail}",
                         metadata=_status_thread_metadata,
                     )
                 except Exception as _ne:
@@ -14636,6 +14678,21 @@ class GatewayRunner:
                     _previewed,
                 )
                 response["already_sent"] = True
+
+        if _auto_linear_link and isinstance(response, dict):
+            try:
+                from gateway.linear_activity import comment_issue
+
+                _ident = _auto_linear_link.get("identifier") or "Linear issue"
+                _status = "failed" if response.get("failed") else "completed"
+                _api_calls = response.get("api_calls") or 0
+                comment_issue(
+                    str(_auto_linear_link.get("issue_id") or ""),
+                    f"Gateway turn {_status}. API calls: {_api_calls}.",
+                )
+                logger.debug("Posted Linear completion comment for %s", _ident)
+            except Exception as _lin_done_exc:
+                logger.debug("Linear completion comment failed: %s", _lin_done_exc)
         
         return response
 

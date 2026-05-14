@@ -18,6 +18,8 @@ from hermes_constants import get_hermes_home
 
 LINEAR_ENDPOINT = "https://api.linear.app/graphql"
 LINKS_FILENAME = "linear_task_links.json"
+HANK_TEAM_KEY = os.getenv("HERMES_LINEAR_TEAM_KEY", "HANK")
+HANK_LABEL_NAME = os.getenv("HERMES_LINEAR_LABEL", "hank")
 
 
 def _now_iso() -> str:
@@ -174,6 +176,151 @@ def list_started_issues(first: int = 12) -> List[Dict[str, Any]]:
     """
     data = _graphql(q, {"first": max(1, min(int(first), 50))})
     return (((data.get("issues") or {}).get("nodes")) or [])
+
+
+def _hank_team_context() -> Dict[str, Any]:
+    """Return the Hank Linear team, label, viewer, and best started state."""
+    q = """
+    query($teamKey: String!, $labelName: String!) {
+      viewer { id name }
+      teams(filter: { key: { eq: $teamKey } }, first: 1) {
+        nodes {
+          id name key
+          labels(filter: { name: { eq: $labelName } }, first: 1) { nodes { id name } }
+          states(first: 50) { nodes { id name type position } }
+        }
+      }
+    }
+    """
+    data = _graphql(q, {"teamKey": HANK_TEAM_KEY, "labelName": HANK_LABEL_NAME})
+    team = (((data.get("teams") or {}).get("nodes")) or [None])[0]
+    if not team:
+        raise RuntimeError(f"Linear team not found: {HANK_TEAM_KEY}")
+    states = ((team.get("states") or {}).get("nodes")) or []
+    started = [s for s in states if s.get("type") == "started"]
+    state = None
+    for preferred in ("In Progress", "Started"):
+        state = next((s for s in started if s.get("name") == preferred), None)
+        if state:
+            break
+    if not state and started:
+        state = sorted(started, key=lambda s: s.get("position") or 0)[0]
+    labels = ((team.get("labels") or {}).get("nodes")) or []
+    return {"viewer": data.get("viewer") or {}, "team": team, "label": labels[0] if labels else None, "state": state}
+
+
+def _summarise_title(text: str, max_len: int = 80) -> str:
+    cleaned = " ".join(str(text or "").strip().split())
+    cleaned = cleaned.replace("`", "")
+    if not cleaned:
+        return "Hank task"
+    if len(cleaned) <= max_len:
+        return cleaned
+    return cleaned[: max_len - 1].rstrip() + "…"
+
+
+def should_auto_create_issue(message: str) -> bool:
+    """Cheap local heuristic: only create Linear issues for real long-running work."""
+    text = " ".join(str(message or "").strip().split())
+    if len(text) < 25:
+        return False
+    if text.startswith("/"):
+        return False
+    lowered = text.lower()
+    trivial_prefixes = (
+        "what is", "what's", "where are", "whats", "thanks", "thank you",
+        "ok", "okay", "yes", "no", "cool", "nice",
+    )
+    if any(lowered == p or lowered.startswith(p + " ") for p in trivial_prefixes):
+        return False
+    action_terms = (
+        "do ", "create", "add", "implement", "fix", "debug", "inspect", "audit",
+        "sync", "update", "commit", "push", "deploy", "write", "generate",
+        "process", "triage", "backfill", "phase",
+    )
+    return any(term in lowered for term in action_terms)
+
+
+def auto_create_issue_for_session(
+    session_key: str,
+    message: str,
+    source: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Create/link a Hank Linear issue for a long-running gateway session.
+
+    Returns the persisted session link, or None when heuristics say not to create.
+    """
+    if not session_key or get_session_link(session_key):
+        return get_session_link(session_key)
+    if not should_auto_create_issue(message):
+        return None
+
+    ctx = _hank_team_context()
+    team = ctx["team"]
+    label = ctx.get("label")
+    state = ctx.get("state")
+    viewer = ctx.get("viewer") or {}
+    title = _summarise_title(message)
+    description = (
+        "Auto-created by Hank because this Telegram/Discord task ran long enough "
+        "to need durable tracking.\n\n"
+        "Details stay in the originating chat/wiki unless explicitly added here."
+    )
+    issue_input: Dict[str, Any] = {
+        "teamId": team["id"],
+        "title": title,
+        "description": description,
+        "priority": 0,
+    }
+    if label:
+        issue_input["labelIds"] = [label["id"]]
+    if state:
+        issue_input["stateId"] = state["id"]
+    if viewer.get("id"):
+        issue_input["assigneeId"] = viewer["id"]
+        issue_input["subscriberIds"] = [viewer["id"]]
+
+    q = """
+    mutation($input: IssueCreateInput!) {
+      issueCreate(input: $input) {
+        success
+        issue {
+          id identifier title url
+          team { key name }
+          state { id name type }
+          assignee { name }
+        }
+      }
+    }
+    """
+    data = _graphql(q, {"input": issue_input})
+    result = data.get("issueCreate") or {}
+    if not result.get("success"):
+        raise RuntimeError("Linear issueCreate returned success=false")
+    issue = result.get("issue") or {}
+    link = attach_session_issue(session_key, issue, source=source)
+    link["auto_created"] = True
+    # Re-save with the auto_created marker.
+    links = _load_links()
+    links["session_links"][session_key] = link
+    _save_links(links)
+    try:
+        comment_issue(
+            str(issue.get("id") or ""),
+            "Started: auto-linked from a long-running Hank chat task.",
+        )
+    except Exception:
+        pass
+    return link
+
+
+def refresh_session_issue(session_key: str) -> Optional[Dict[str, Any]]:
+    """Refresh cached Linear issue metadata for an attached session."""
+    link = get_session_link(session_key)
+    if not link or not link.get("identifier"):
+        return link
+    issue = get_issue(str(link["identifier"]))
+    return attach_session_issue(session_key, issue, source=link.get("source") or {})
 
 
 def format_issue_line(issue: Dict[str, Any]) -> str:
