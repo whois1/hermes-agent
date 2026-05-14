@@ -7420,7 +7420,7 @@ class GatewayRunner:
             if subcmd in ("show", "status"):
                 link = get_session_link(session_key)
                 if not link:
-                    return "No Linear issue is attached to this chat/session. Use `/linear attach UTI-123`."
+                    return "No Linear issue is attached to this chat/session. Use `/linear attach HANK-123`."
                 url = link.get("url") or ""
                 return "\n".join([
                     "📌 **Linear link for this session**",
@@ -7445,7 +7445,7 @@ class GatewayRunner:
 
             if subcmd == "attach":
                 if not rest:
-                    return "Usage: `/linear attach UTI-123`"
+                    return "Usage: `/linear attach HANK-123`"
                 issue = get_issue(rest)
                 source = {
                     "platform": str(getattr(event.source.platform, "value", event.source.platform)),
@@ -7466,7 +7466,7 @@ class GatewayRunner:
                     return "Usage: `/linear comment <text>`"
                 link = get_session_link(session_key)
                 if not link:
-                    return "No Linear issue is attached. Use `/linear attach UTI-123` first."
+                    return "No Linear issue is attached. Use `/linear attach HANK-123` first."
                 comment = comment_issue(str(link.get("issue_id") or ""), rest)
                 return f"Commented on Linear `{link.get('identifier')}`."
 
