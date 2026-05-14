@@ -5057,9 +5057,14 @@ class GatewayRunner:
                     return await self._handle_approve_command(event)
                 return await self._handle_deny_command(event)
 
-            # /agents (/tasks alias) should be query-only and never interrupt.
-            if _cmd_def_inner and _cmd_def_inner.name == "agents":
-                return await self._handle_agents_command(event)
+            # /agents, /activity, and /linear are query/control-plane commands
+            # that should never interrupt an active agent.
+            if _cmd_def_inner and _cmd_def_inner.name in ("agents", "activity", "linear"):
+                if _cmd_def_inner.name == "agents":
+                    return await self._handle_agents_command(event)
+                if _cmd_def_inner.name == "activity":
+                    return await self._handle_activity_command(event)
+                return await self._handle_linear_command(event)
 
             # /background must bypass the running-agent guard — it starts a
             # parallel task and must never interrupt the active conversation.
@@ -5333,6 +5338,12 @@ class GatewayRunner:
 
         if canonical == "agents":
             return await self._handle_agents_command(event)
+
+        if canonical == "activity":
+            return await self._handle_activity_command(event)
+
+        if canonical == "linear":
+            return await self._handle_linear_command(event)
 
         if canonical == "restart":
             return await self._handle_restart_command(event)
@@ -7342,6 +7353,131 @@ class GatewayRunner:
             lines.append("No active agents or running tasks.")
 
         return "\n".join(lines)
+
+    async def _handle_activity_command(self, event: MessageEvent) -> str:
+        """Show live runtime activity plus Linear started issues."""
+        lines = [await self._handle_agents_command(event), "", "📌 **Linear started issues**"]
+        try:
+            from gateway.linear_activity import format_issue_line, list_started_issues, safe_error
+
+            issues = list_started_issues(first=12)
+            if issues:
+                lines.extend(format_issue_line(issue) for issue in issues)
+            else:
+                lines.append("No Linear issues currently in a started state.")
+        except Exception as exc:
+            try:
+                from gateway.linear_activity import safe_error
+                err = safe_error(exc)
+            except Exception:
+                err = str(exc)[:300]
+            lines.append(f"Linear unavailable: {err}")
+
+        # Cron is durable scheduled work, not necessarily active runtime. Include a
+        # compact view because Michael uses /activity as the operator snapshot.
+        try:
+            cron_path = Path(os.path.expanduser("~/.hermes/cron/jobs.json"))
+            if os.getenv("HERMES_HOME"):
+                cron_path = Path(os.getenv("HERMES_HOME", "")) / "cron" / "jobs.json"
+            if cron_path.exists():
+                data = json.loads(cron_path.read_text())
+                jobs = data.get("jobs", []) if isinstance(data, dict) else data
+                if isinstance(jobs, list):
+                    enabled = [j for j in jobs if isinstance(j, dict) and j.get("enabled")]
+                    failed = [j for j in enabled if j.get("last_status") == "error"]
+                    lines.extend(["", "🕒 **Cron**"])
+                    lines.append(f"Enabled: {len(enabled)}" + (f" · Failed last run: {len(failed)}" if failed else ""))
+                    for job in failed[:5]:
+                        name = job.get("name") or job.get("id") or "?"
+                        next_run = job.get("next_run_at") or "?"
+                        lines.append(f"- `{name}` — last error — next {next_run}")
+        except Exception:
+            pass
+
+        return "\n".join(lines)
+
+    async def _handle_linear_command(self, event: MessageEvent) -> str:
+        """Handle /linear control-plane commands for the current gateway session."""
+        args = (event.get_command_args() or "").strip()
+        parts = args.split(maxsplit=1)
+        subcmd = parts[0].lower() if parts else "show"
+        rest = parts[1].strip() if len(parts) > 1 else ""
+        session_key = self._session_key_for_source(event.source)
+
+        try:
+            from gateway.linear_activity import (
+                attach_session_issue,
+                comment_issue,
+                detach_session_issue,
+                format_issue_line,
+                get_issue,
+                get_session_link,
+                list_started_issues,
+                safe_error,
+                viewer_and_teams,
+            )
+
+            if subcmd in ("show", "status"):
+                link = get_session_link(session_key)
+                if not link:
+                    return "No Linear issue is attached to this chat/session. Use `/linear attach UTI-123`."
+                url = link.get("url") or ""
+                return "\n".join([
+                    "📌 **Linear link for this session**",
+                    f"Issue: `{link.get('identifier')}` — {link.get('title')}",
+                    f"State: {link.get('state') or '?'}",
+                    f"URL: {url}",
+                ])
+
+            if subcmd == "whoami":
+                data = viewer_and_teams()
+                viewer = data.get("viewer") or {}
+                teams = ((data.get("teams") or {}).get("nodes")) or []
+                lines = [f"Linear connected as **{viewer.get('name', '?')}**.", "Teams:"]
+                lines.extend(f"- `{t.get('key')}` — {t.get('name')}" for t in teams)
+                return "\n".join(lines)
+
+            if subcmd == "started":
+                issues = list_started_issues(first=20)
+                if not issues:
+                    return "No Linear issues currently in a started state."
+                return "\n".join(["📌 **Linear started issues**", *[format_issue_line(issue) for issue in issues]])
+
+            if subcmd == "attach":
+                if not rest:
+                    return "Usage: `/linear attach UTI-123`"
+                issue = get_issue(rest)
+                source = {
+                    "platform": str(getattr(event.source.platform, "value", event.source.platform)),
+                    "chat_id": str(getattr(event.source, "chat_id", "") or ""),
+                    "thread_id": str(getattr(event.source, "thread_id", "") or ""),
+                }
+                link = attach_session_issue(session_key, issue, source=source)
+                return f"Attached this session to Linear `{link.get('identifier')}` — {link.get('title')}\n{link.get('url') or ''}".strip()
+
+            if subcmd == "detach":
+                old = detach_session_issue(session_key)
+                if not old:
+                    return "No Linear issue was attached to this chat/session."
+                return f"Detached Linear `{old.get('identifier')}` from this chat/session."
+
+            if subcmd == "comment":
+                if not rest:
+                    return "Usage: `/linear comment <text>`"
+                link = get_session_link(session_key)
+                if not link:
+                    return "No Linear issue is attached. Use `/linear attach UTI-123` first."
+                comment = comment_issue(str(link.get("issue_id") or ""), rest)
+                return f"Commented on Linear `{link.get('identifier')}`."
+
+            return "Usage: `/linear show|attach <issue>|detach|comment <text>|started|whoami`"
+        except Exception as exc:
+            try:
+                from gateway.linear_activity import safe_error
+                err = safe_error(exc)
+            except Exception:
+                err = str(exc)[:300]
+            return f"Linear command failed: {err}"
 
     async def _handle_stop_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
         """Handle /stop command - interrupt a running agent.
