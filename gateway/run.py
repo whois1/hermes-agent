@@ -14679,20 +14679,26 @@ class GatewayRunner:
                 )
                 response["already_sent"] = True
 
-        if _auto_linear_link and isinstance(response, dict):
+        if session_key and isinstance(response, dict):
             try:
-                from gateway.linear_activity import comment_issue
+                from gateway.linear_activity import finish_session_issue, get_session_link
 
-                _ident = _auto_linear_link.get("identifier") or "Linear issue"
-                _status = "failed" if response.get("failed") else "completed"
-                _api_calls = response.get("api_calls") or 0
-                comment_issue(
-                    str(_auto_linear_link.get("issue_id") or ""),
-                    f"Gateway turn {_status}. API calls: {_api_calls}.",
-                )
-                logger.debug("Posted Linear completion comment for %s", _ident)
+                _linked = _auto_linear_link or get_session_link(session_key)
+                if _linked and _linked.get("auto_created"):
+                    _status = "failed" if response.get("failed") else "completed"
+                    _api_calls = int(response.get("api_calls") or 0)
+                    _finished = finish_session_issue(
+                        session_key,
+                        failed=bool(response.get("failed")),
+                        api_calls=_api_calls,
+                    )
+                    logger.debug(
+                        "Finished auto-linked Linear issue %s (%s)",
+                        ((_finished or _linked).get("identifier") or "Linear issue"),
+                        _status,
+                    )
             except Exception as _lin_done_exc:
-                logger.debug("Linear completion comment failed: %s", _lin_done_exc)
+                logger.debug("Linear completion update failed: %s", _lin_done_exc)
         
         return response
 

@@ -75,9 +75,11 @@ def attach_session_issue(session_key: str, issue: Dict[str, Any], source: Option
         "updated_at": _now_iso(),
     }
     existing = data["session_links"].get(session_key) or {}
-    if isinstance(existing, dict) and existing.get("created_at"):
-        record["created_at"] = existing["created_at"]
-    else:
+    if isinstance(existing, dict):
+        for key in ("auto_created", "created_at"):
+            if key in existing:
+                record[key] = existing[key]
+    if not record.get("created_at"):
         record["created_at"] = record["updated_at"]
     data["session_links"][session_key] = record
     _save_links(data)
@@ -320,6 +322,68 @@ def refresh_session_issue(session_key: str) -> Optional[Dict[str, Any]]:
     if not link or not link.get("identifier"):
         return link
     issue = get_issue(str(link["identifier"]))
+    return attach_session_issue(session_key, issue, source=link.get("source") or {})
+
+
+def _team_state_by_type(team_key: str, desired_type: str, preferred_names: tuple[str, ...]) -> Optional[Dict[str, Any]]:
+    q = """
+    query($teamKey: String!) {
+      teams(filter: { key: { eq: $teamKey } }, first: 1) {
+        nodes { states(first: 50) { nodes { id name type position } } }
+      }
+    }
+    """
+    data = _graphql(q, {"teamKey": team_key})
+    team = (((data.get("teams") or {}).get("nodes")) or [None])[0]
+    states = (((team or {}).get("states") or {}).get("nodes")) or []
+    candidates = [s for s in states if s.get("type") == desired_type]
+    for name in preferred_names:
+        found = next((s for s in candidates if s.get("name") == name), None)
+        if found:
+            return found
+    if candidates:
+        return sorted(candidates, key=lambda s: s.get("position") or 0)[0]
+    return None
+
+
+def update_issue_state(issue_id: str, state_id: str) -> Dict[str, Any]:
+    q = """
+    mutation($id: String!, $input: IssueUpdateInput!) {
+      issueUpdate(id: $id, input: $input) {
+        success
+        issue { id identifier title url team { key name } state { id name type } assignee { name } }
+      }
+    }
+    """
+    data = _graphql(q, {"id": issue_id, "input": {"stateId": state_id}})
+    result = data.get("issueUpdate") or {}
+    if not result.get("success"):
+        raise RuntimeError("Linear issueUpdate returned success=false")
+    return result.get("issue") or {}
+
+
+def finish_session_issue(session_key: str, *, failed: bool = False, api_calls: int = 0) -> Optional[Dict[str, Any]]:
+    """Post a terminal milestone and move an auto-linked session issue out of Started.
+
+    Returns the refreshed link.  Safe to call repeatedly; terminal states are left terminal.
+    """
+    link = get_session_link(session_key)
+    if not link or not link.get("issue_id"):
+        return link
+    issue = get_issue(str(link.get("identifier") or link.get("issue_id")))
+    state_type = (issue.get("state") or {}).get("type")
+    status = "failed" if failed else "completed"
+    if state_type not in ("completed", "canceled"):
+        try:
+            comment_issue(str(link["issue_id"]), f"Gateway turn {status}. API calls: {api_calls}.")
+        except Exception:
+            pass
+        team_key = (issue.get("team") or {}).get("key") or link.get("team_key") or HANK_TEAM_KEY
+        desired_type = "canceled" if failed else "completed"
+        preferred = ("Canceled", "Cancelled") if failed else ("Done", "Completed")
+        terminal_state = _team_state_by_type(str(team_key), desired_type, preferred)
+        if terminal_state:
+            issue = update_issue_state(str(link["issue_id"]), str(terminal_state["id"]))
     return attach_session_issue(session_key, issue, source=link.get("source") or {})
 
 
