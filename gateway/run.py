@@ -7274,11 +7274,42 @@ class GatewayRunner:
         running_agents: dict = getattr(self, "_running_agents", {}) or {}
         running_started: dict = getattr(self, "_running_agents_ts", {}) or {}
 
+        def _preview_event_text(evt: Any) -> str:
+            try:
+                text = str(getattr(evt, "text", "") or "").strip()
+            except Exception:
+                text = ""
+            text = " ".join(text.split())
+            if len(text) > 90:
+                text = text[:87] + "..."
+            return text
+
+        def _queue_depth_any_adapter(session_key: str) -> tuple[int, str]:
+            depth = len((getattr(self, "_queued_events", None) or {}).get(session_key, []))
+            preview = ""
+            for adapter_obj in (getattr(self, "adapters", {}) or {}).values():
+                pending = getattr(adapter_obj, "_pending_messages", {}) or {}
+                if session_key in pending:
+                    depth += 1
+                    preview = preview or _preview_event_text(pending.get(session_key))
+            if not preview:
+                overflow = (getattr(self, "_queued_events", None) or {}).get(session_key, [])
+                if overflow:
+                    preview = _preview_event_text(overflow[0])
+            return depth, preview
+
         agent_rows: list[dict] = []
         for session_key, agent in running_agents.items():
             started = float(running_started.get(session_key, now))
             elapsed = max(0, int(now - started))
             is_pending = agent is _AGENT_PENDING_SENTINEL
+            activity = {}
+            if not is_pending and hasattr(agent, "get_activity_summary"):
+                try:
+                    activity = agent.get_activity_summary() or {}
+                except Exception:
+                    activity = {}
+            queue_depth, queue_preview = _queue_depth_any_adapter(session_key)
             agent_rows.append(
                 {
                     "session_key": session_key,
@@ -7286,6 +7317,9 @@ class GatewayRunner:
                     "state": "starting" if is_pending else "running",
                     "session_id": "" if is_pending else str(getattr(agent, "session_id", "") or ""),
                     "model": "" if is_pending else str(getattr(agent, "model", "") or ""),
+                    "activity": activity,
+                    "queue_depth": queue_depth,
+                    "queue_preview": queue_preview,
                 }
             )
 
@@ -7316,9 +7350,27 @@ class GatewayRunner:
                 current = " · this chat" if row["session_key"] == current_session_key else ""
                 sid = f" · `{row['session_id']}`" if row["session_id"] else ""
                 model = f" · `{row['model']}`" if row["model"] else ""
+                detail_parts = []
+                activity = row.get("activity") or {}
+                if activity:
+                    iter_part = f"iter {activity.get('api_call_count', 0)}/{activity.get('max_iterations', 0)}"
+                    detail_parts.append(iter_part)
+                    if activity.get("current_tool"):
+                        detail_parts.append(f"tool `{activity.get('current_tool')}`")
+                    elif activity.get("last_activity_desc"):
+                        detail_parts.append(str(activity.get("last_activity_desc"))[:80])
+                    idle = int(float(activity.get("seconds_since_activity") or 0))
+                    if idle >= 10:
+                        detail_parts.append(f"idle {idle}s")
+                if row.get("queue_depth"):
+                    q = f"queued {row['queue_depth']}"
+                    if row.get("queue_preview"):
+                        q += f": “{row['queue_preview']}”"
+                    detail_parts.append(q)
+                detail = f" · {' · '.join(detail_parts)}" if detail_parts else ""
                 lines.append(
                     f"{idx}. `{row['session_key']}` · {row['state']} · "
-                    f"{format_uptime_short(row['elapsed'])}{sid}{model}{current}"
+                    f"{format_uptime_short(row['elapsed'])}{sid}{model}{current}{detail}"
                 )
             if len(agent_rows) > 12:
                 lines.append(f"... and {len(agent_rows) - 12} more")
@@ -7356,7 +7408,31 @@ class GatewayRunner:
 
     async def _handle_activity_command(self, event: MessageEvent) -> str:
         """Show live runtime activity plus Linear started issues."""
-        lines = [await self._handle_agents_command(event), "", "📌 **Linear started issues**"]
+        lines = [await self._handle_agents_command(event), ""]
+
+        try:
+            from tools.delegate_tool import list_active_subagents
+
+            subagents = list_active_subagents()
+            lines.append("🧩 **Active subagents**")
+            if subagents:
+                for sub in subagents[:12]:
+                    goal = " ".join(str(sub.get("goal") or "").split())
+                    if len(goal) > 100:
+                        goal = goal[:97] + "..."
+                    lines.append(
+                        f"- `{sub.get('subagent_id', '?')}` · depth {sub.get('depth', '?')} · "
+                        f"{sub.get('status', 'running')} · tools {sub.get('tool_count', 0)} · {goal}"
+                    )
+                if len(subagents) > 12:
+                    lines.append(f"... and {len(subagents) - 12} more")
+            else:
+                lines.append("No active delegated subagents.")
+            lines.append("")
+        except Exception:
+            lines.extend(["🧩 **Active subagents**", "Unavailable.", ""])
+
+        lines.append("📌 **Linear started issues**")
         try:
             from gateway.linear_activity import format_issue_line, list_started_issues, safe_error
 
