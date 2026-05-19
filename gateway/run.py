@@ -14281,11 +14281,9 @@ class GatewayRunner:
         _NOTIFY_INTERVAL_RAW = _float_env("HERMES_AGENT_NOTIFY_INTERVAL", 180)
         _NOTIFY_INTERVAL = _NOTIFY_INTERVAL_RAW if _NOTIFY_INTERVAL_RAW > 0 else None
         _notify_start = time.time()
-        _auto_linear_attempted = False
         _auto_linear_link = None
 
         async def _notify_long_running():
-            nonlocal _auto_linear_attempted, _auto_linear_link
             if _NOTIFY_INTERVAL is None:
                 return  # Notifications disabled (gateway_notify_interval: 0)
             _notify_adapter = self.adapters.get(source.platform)
@@ -14313,44 +14311,13 @@ class GatewayRunner:
                     except Exception:
                         pass
 
-                _linear_detail = ""
-                if session_key and not _auto_linear_attempted:
-                    _auto_linear_attempted = True
-                    try:
-                        from gateway.linear_activity import auto_create_issue_for_session, safe_error
-
-                        _source_meta = {
-                            "platform": str(getattr(source.platform, "value", source.platform)),
-                            "chat_id": str(getattr(source, "chat_id", "") or ""),
-                            "thread_id": str(getattr(source, "thread_id", "") or ""),
-                        }
-                        _auto_linear_link = auto_create_issue_for_session(
-                            session_key,
-                            message,
-                            source=_source_meta,
-                        )
-                        if _auto_linear_link:
-                            _linear_detail = f" · Linear `{_auto_linear_link.get('identifier')}`"
-                    except Exception as _lin_exc:
-                        try:
-                            _linear_detail = f" · Linear link failed: {safe_error(_lin_exc)}"
-                        except Exception:
-                            _linear_detail = " · Linear link failed"
-                elif _auto_linear_link:
-                    _linear_detail = f" · Linear `{_auto_linear_link.get('identifier')}`"
-                else:
-                    try:
-                        from gateway.linear_activity import get_session_link
-                        _attached = get_session_link(session_key) if session_key else None
-                        if _attached:
-                            _linear_detail = f" · Linear `{_attached.get('identifier')}`"
-                    except Exception:
-                        pass
-
+                # Keep long-running pings lightweight and temporary. Do not create
+                # or advertise Linear issues from a chat heartbeat; explicit
+                # `/linear` and `/activity` commands still expose tracking when wanted.
                 try:
                     await _notify_adapter.send(
                         source.chat_id,
-                        f"⏳ Still working ({_elapsed_mins} min{_linear_detail}){_status_detail}",
+                        EphemeralReply(f"⏳ Still working ({_elapsed_mins} min){_status_detail}"),
                         metadata=_status_thread_metadata,
                     )
                 except Exception as _ne:
