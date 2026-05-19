@@ -1977,8 +1977,8 @@ class GatewayRunner:
     ) -> tuple[dict | None, str | None]:
         """Resolve reasoning effort for a session, honoring session overrides and auto policy.
 
-        Returns ``(reasoning_config, notice)``. ``notice`` is a short user-visible
-        announcement when ``agent.reasoning_effort: auto`` chooses medium/high.
+        Returns ``(reasoning_config, notice)``. ``notice`` is the concise
+        user-visible effort label prepended to the final reply.
         """
         resolved_session_key = session_key
         if not resolved_session_key and source is not None:
@@ -1989,12 +1989,24 @@ class GatewayRunner:
 
         overrides = getattr(self, "_session_reasoning_overrides", {}) or {}
         if resolved_session_key and resolved_session_key in overrides:
-            return overrides[resolved_session_key], None
+            reasoning_config = overrides[resolved_session_key]
+            return reasoning_config, self._reasoning_effort_notice(reasoning_config)
 
         raw_effort = self._load_reasoning_effort_raw()
         if raw_effort == "auto":
             return self._auto_reasoning_for_message(message)
-        return self._load_reasoning_config(), None
+        reasoning_config = self._load_reasoning_config()
+        return reasoning_config, self._reasoning_effort_notice(reasoning_config)
+
+    @staticmethod
+    def _reasoning_effort_notice(reasoning_config: dict | None) -> str:
+        """Return the shortest useful user-visible reasoning effort label."""
+        if not reasoning_config:
+            return "🧠 medium"
+        if reasoning_config.get("enabled") is False:
+            return "🧠 none"
+        effort = str(reasoning_config.get("effort") or "medium").strip().lower()
+        return f"🧠 {effort}"
 
     @staticmethod
     def _load_reasoning_effort_raw() -> str:
@@ -2032,10 +2044,13 @@ class GatewayRunner:
             "correctly", "sync", "wiki", "zendesk", "linear", "multi-step", "why",
         )
         if any(term in text for term in high_terms):
-            return {"enabled": True, "effort": "high"}, "🧠 Reasoning: auto → high — code/auth/security risk"
+            reasoning_config = {"enabled": True, "effort": "high"}
+            return reasoning_config, GatewayRunner._reasoning_effort_notice(reasoning_config)
         if any(term in text for term in medium_terms):
-            return {"enabled": True, "effort": "medium"}, "🧠 Reasoning: auto → medium — investigation/config/tradeoff"
-        return {"enabled": True, "effort": "low"}, None
+            reasoning_config = {"enabled": True, "effort": "medium"}
+            return reasoning_config, GatewayRunner._reasoning_effort_notice(reasoning_config)
+        reasoning_config = {"enabled": True, "effort": "low"}
+        return reasoning_config, GatewayRunner._reasoning_effort_notice(reasoning_config)
 
     def _set_session_reasoning_override(
         self,

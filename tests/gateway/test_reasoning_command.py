@@ -245,7 +245,7 @@ class TestReasoningCommand:
             )
         )
 
-        assert result["final_response"] == "ok"
+        assert result["final_response"] == "🧠 low\n\nok"
         assert _CapturingAgent.last_init is not None
         assert _CapturingAgent.last_init["reasoning_config"] == {"enabled": True, "effort": "low"}
 
@@ -293,8 +293,53 @@ class TestReasoningCommand:
         )
 
         assert _CapturingAgent.last_init["reasoning_config"] == {"enabled": True, "effort": "high"}
-        assert result["final_response"].startswith("🧠 Reasoning: auto → high")
-        assert "code/auth/security risk" in result["final_response"]
+        assert result["final_response"] == "🧠 high\n\nok"
+
+    def test_run_agent_auto_reasoning_labels_low(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text("agent:\n  reasoning_effort: auto\n", encoding="utf-8")
+
+        monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
+        monkeypatch.setattr(gateway_run, "_env_path", hermes_home / ".env")
+        monkeypatch.setattr(gateway_run, "load_dotenv", lambda *args, **kwargs: None)
+        monkeypatch.setattr(
+            gateway_run,
+            "_resolve_runtime_agent_kwargs",
+            lambda: {
+                "provider": "openrouter",
+                "api_mode": "chat_completions",
+                "base_url": "https://openrouter.ai/api/v1",
+                "api_key": "test-key",
+            },
+        )
+        fake_run_agent = types.ModuleType("run_agent")
+        fake_run_agent.AIAgent = _CapturingAgent
+        monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+        _CapturingAgent.last_init = None
+        runner = _make_runner()
+        source = SessionSource(
+            platform=Platform.LOCAL,
+            chat_id="cli",
+            chat_name="CLI",
+            chat_type="dm",
+            user_id="user-1",
+        )
+
+        result = asyncio.run(
+            runner._run_agent(
+                message="hello",
+                context_prompt="",
+                history=[],
+                source=source,
+                session_id="session-1",
+                session_key="agent:main:local:dm",
+            )
+        )
+
+        assert _CapturingAgent.last_init["reasoning_config"] == {"enabled": True, "effort": "low"}
+        assert result["final_response"] == "🧠 low\n\nok"
 
     def test_auto_reasoning_escalates_setup_verification_to_medium(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / "hermes"
@@ -309,7 +354,7 @@ class TestReasoningCommand:
         )
 
         assert reasoning_config == {"enabled": True, "effort": "medium"}
-        assert notice == "🧠 Reasoning: auto → medium — investigation/config/tradeoff"
+        assert notice == "🧠 medium"
 
     def test_run_agent_auto_reasoning_respects_manual_session_override(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / "hermes"
@@ -357,7 +402,7 @@ class TestReasoningCommand:
         )
 
         assert _CapturingAgent.last_init["reasoning_config"] == {"enabled": True, "effort": "low"}
-        assert result["final_response"] == "ok"
+        assert result["final_response"] == "🧠 low\n\nok"
 
     def test_run_agent_prefers_session_reasoning_override(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / "hermes"
@@ -405,7 +450,7 @@ class TestReasoningCommand:
             )
         )
 
-        assert result["final_response"] == "ok"
+        assert result["final_response"] == "🧠 high\n\nok"
         assert _CapturingAgent.last_init is not None
         assert _CapturingAgent.last_init["reasoning_config"] == {"enabled": True, "effort": "high"}
 
@@ -462,7 +507,7 @@ class TestReasoningCommand:
             )
         )
 
-        assert result["final_response"] == "ok"
+        assert result["final_response"] == "🧠 medium\n\nok"
         assert _CapturingAgent.last_init is not None
         enabled_toolsets = set(_CapturingAgent.last_init["enabled_toolsets"])
         assert "web" in enabled_toolsets
@@ -514,7 +559,7 @@ class TestReasoningCommand:
             )
         )
 
-        assert result["final_response"] == "ok"
+        assert result["final_response"] == "🧠 medium\n\nok"
         assert _CapturingAgent.last_init is not None
         assert "homeassistant" in set(_CapturingAgent.last_init["enabled_toolsets"])
 
