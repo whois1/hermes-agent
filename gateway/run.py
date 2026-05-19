@@ -1019,7 +1019,8 @@ class GatewayRunner:
         # Both are injected at API-call time only and never persisted.
         self._prefill_messages = self._load_prefill_messages()
         self._ephemeral_system_prompt = self._load_ephemeral_system_prompt()
-        self._reasoning_config = self._load_reasoning_config()
+        _raw_reasoning_effort = self._load_reasoning_effort_raw()
+        self._reasoning_config = None if _raw_reasoning_effort == "auto" else self._load_reasoning_config()
         self._service_tier = self._load_service_tier()
         self._show_reasoning = self._load_show_reasoning()
         self._busy_input_mode = self._load_busy_input_mode()
@@ -2026,8 +2027,9 @@ class GatewayRunner:
         )
         medium_terms = (
             "investigate", "debug", "diagnose", "analyse", "analyze", "compare",
-            "tradeoff", "trade-off", "recommend", "plan", "config", "configure",
-            "setup", "sync", "wiki", "zendesk", "linear", "multi-step", "why",
+            "tradeoff", "trade-off", "recommend", "recommendation", "plan",
+            "config", "configure", "setup", "set up", "verify", "check things",
+            "correctly", "sync", "wiki", "zendesk", "linear", "multi-step", "why",
         )
         if any(term in text for term in high_terms):
             return {"enabled": True, "effort": "high"}, "🧠 Reasoning: auto → high — code/auth/security risk"

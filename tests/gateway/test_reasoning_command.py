@@ -296,6 +296,21 @@ class TestReasoningCommand:
         assert result["final_response"].startswith("🧠 Reasoning: auto → high")
         assert "code/auth/security risk" in result["final_response"]
 
+    def test_auto_reasoning_escalates_setup_verification_to_medium(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text("agent:\n  reasoning_effort: auto\n", encoding="utf-8")
+        monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
+
+        runner = _make_runner()
+
+        reasoning_config, notice = runner._resolve_session_reasoning_config(
+            message="I didn't see this, check things are set up correctly"
+        )
+
+        assert reasoning_config == {"enabled": True, "effort": "medium"}
+        assert notice == "🧠 Reasoning: auto → medium — investigation/config/tradeoff"
+
     def test_run_agent_auto_reasoning_respects_manual_session_override(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir()
