@@ -1972,8 +1972,13 @@ class GatewayRunner:
         *,
         source: Optional[SessionSource] = None,
         session_key: Optional[str] = None,
-    ) -> dict | None:
-        """Resolve reasoning effort for a session, honoring session overrides."""
+        message: str = "",
+    ) -> tuple[dict | None, str | None]:
+        """Resolve reasoning effort for a session, honoring session overrides and auto policy.
+
+        Returns ``(reasoning_config, notice)``. ``notice`` is a short user-visible
+        announcement when ``agent.reasoning_effort: auto`` chooses medium/high.
+        """
         resolved_session_key = session_key
         if not resolved_session_key and source is not None:
             try:
@@ -1983,8 +1988,52 @@ class GatewayRunner:
 
         overrides = getattr(self, "_session_reasoning_overrides", {}) or {}
         if resolved_session_key and resolved_session_key in overrides:
-            return overrides[resolved_session_key]
-        return self._load_reasoning_config()
+            return overrides[resolved_session_key], None
+
+        raw_effort = self._load_reasoning_effort_raw()
+        if raw_effort == "auto":
+            return self._auto_reasoning_for_message(message)
+        return self._load_reasoning_config(), None
+
+    @staticmethod
+    def _load_reasoning_effort_raw() -> str:
+        """Load raw agent.reasoning_effort from config.yaml."""
+        try:
+            import yaml as _y
+            cfg_path = _hermes_home / "config.yaml"
+            if cfg_path.exists():
+                with open(cfg_path, encoding="utf-8") as _f:
+                    cfg = _y.safe_load(_f) or {}
+                return str(cfg_get(cfg, "agent", "reasoning_effort", default="") or "").strip().lower()
+        except Exception:
+            pass
+        return ""
+
+    @staticmethod
+    def _auto_reasoning_for_message(message: str) -> tuple[dict, str | None]:
+        """Classify a gateway message into a practical reasoning effort.
+
+        Deliberately simple and deterministic: default low, medium for
+        investigation/tradeoff/config work, high for code/auth/security/risky
+        operations. User slash-command overrides bypass this method.
+        """
+        text = str(message or "").lower()
+        high_terms = (
+            "code", "bug", "fix", "patch", "implement", "refactor", "test", "tests",
+            "gateway", "cron", "auth", "security", "secret", "token", "password",
+            "migration", "migrate", "rollback", "production", "destructive", "delete",
+            "rm -rf", "hard reset", "git reset", "deploy", "incident",
+        )
+        medium_terms = (
+            "investigate", "debug", "diagnose", "analyse", "analyze", "compare",
+            "tradeoff", "trade-off", "recommend", "plan", "config", "configure",
+            "setup", "sync", "wiki", "zendesk", "linear", "multi-step", "why",
+        )
+        if any(term in text for term in high_terms):
+            return {"enabled": True, "effort": "high"}, "🧠 Reasoning: auto → high — code/auth/security risk"
+        if any(term in text for term in medium_terms):
+            return {"enabled": True, "effort": "medium"}, "🧠 Reasoning: auto → medium — investigation/config/tradeoff"
+        return {"enabled": True, "effort": "low"}, None
 
     def _set_session_reasoning_override(
         self,
@@ -9160,7 +9209,10 @@ class GatewayRunner:
 
             pr = self._provider_routing
             max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
-            reasoning_config = self._resolve_session_reasoning_config(source=source)
+            reasoning_config, _reasoning_notice = self._resolve_session_reasoning_config(
+                source=source,
+                message=prompt,
+            )
             self._reasoning_config = reasoning_config
             self._service_tier = self._load_service_tier()
             turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
@@ -9288,7 +9340,7 @@ class GatewayRunner:
         config_path = _hermes_home / "config.yaml"
         session_key = self._session_key_for_source(event.source)
         self._show_reasoning = self._load_show_reasoning()
-        self._reasoning_config = self._resolve_session_reasoning_config(
+        self._reasoning_config, _ = self._resolve_session_reasoning_config(
             source=event.source,
             session_key=session_key,
         )
@@ -13434,9 +13486,10 @@ class GatewayRunner:
                 }
 
             pr = self._provider_routing
-            reasoning_config = self._resolve_session_reasoning_config(
+            reasoning_config, reasoning_notice = self._resolve_session_reasoning_config(
                 source=source,
                 session_key=session_key,
+                message=message,
             )
             self._reasoning_config = reasoning_config
             self._service_tier = self._load_service_tier()
@@ -13960,6 +14013,8 @@ class GatewayRunner:
             
             # Return final response, or a message if something went wrong
             final_response = result.get("final_response")
+            if reasoning_notice and final_response:
+                final_response = f"{reasoning_notice}\n\n{final_response}"
 
             # Extract actual token counts from the agent instance used for this run
             _last_prompt_toks = 0
