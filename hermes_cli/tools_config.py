@@ -264,6 +264,15 @@ TOOL_CATEGORIES = {
                 ],
             },
             {
+                "name": "Brave Search",
+                "badge": "free tier",
+                "tag": "Independent web search API",
+                "web_backend": "brave",
+                "env_vars": [
+                    {"key": "BRAVE_SEARCH_API_KEY", "prompt": "Brave Search API key", "url": "https://api.search.brave.com/"},
+                ],
+            },
+            {
                 "name": "Exa",
                 "badge": "paid",
                 "tag": "Neural search with semantic understanding",

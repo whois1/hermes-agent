@@ -276,6 +276,7 @@ def get_nous_subscription_features(
     image_gen_cfg = config.get("image_gen") if isinstance(config.get("image_gen"), dict) else {}
     image_use_gateway = _uses_gateway(image_gen_cfg)
 
+    direct_brave = bool(get_env_value("BRAVE_SEARCH_API_KEY"))
     direct_exa = bool(get_env_value("EXA_API_KEY"))
     direct_firecrawl = bool(get_env_value("FIRECRAWL_API_KEY") or get_env_value("FIRECRAWL_API_URL"))
     direct_parallel = bool(get_env_value("PARALLEL_API_KEY"))
@@ -290,6 +291,7 @@ def get_nous_subscription_features(
 
     # When use_gateway is set, suppress direct credentials for managed detection
     if web_use_gateway:
+        direct_brave = False
         direct_firecrawl = False
         direct_exa = False
         direct_parallel = False
@@ -319,6 +321,7 @@ def get_nous_subscription_features(
         web_tool_enabled
         and (
             web_managed
+            or (web_backend == "brave" and direct_brave)
             or (web_backend == "exa" and direct_exa)
             or (web_backend == "firecrawl" and direct_firecrawl)
             or (web_backend == "parallel" and direct_parallel)
@@ -326,7 +329,7 @@ def get_nous_subscription_features(
         )
     )
     web_available = bool(
-        managed_web_available or direct_exa or direct_firecrawl or direct_parallel or direct_tavily
+        managed_web_available or direct_brave or direct_exa or direct_firecrawl or direct_parallel or direct_tavily
     )
 
     image_managed = image_tool_enabled and managed_image_available and not direct_fal
@@ -507,7 +510,8 @@ def apply_nous_managed_defaults(
         config["browser"] = browser_cfg
 
     if "web" in selected_toolsets and not features.web.explicit_configured and not (
-        get_env_value("PARALLEL_API_KEY")
+        get_env_value("BRAVE_SEARCH_API_KEY")
+        or get_env_value("PARALLEL_API_KEY")
         or get_env_value("TAVILY_API_KEY")
         or get_env_value("FIRECRAWL_API_KEY")
         or get_env_value("FIRECRAWL_API_URL")
@@ -551,7 +555,8 @@ def _get_gateway_direct_credentials() -> Dict[str, bool]:
     """Return a dict of tool_key -> has_direct_credentials."""
     return {
         "web": bool(
-            get_env_value("FIRECRAWL_API_KEY")
+            get_env_value("BRAVE_SEARCH_API_KEY")
+            or get_env_value("FIRECRAWL_API_KEY")
             or get_env_value("FIRECRAWL_API_URL")
             or get_env_value("PARALLEL_API_KEY")
             or get_env_value("TAVILY_API_KEY")

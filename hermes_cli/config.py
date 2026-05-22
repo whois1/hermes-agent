@@ -1724,6 +1724,14 @@ OPTIONAL_ENV_VARS = {
     },
 
     # ── Tool API keys ──
+    "BRAVE_SEARCH_API_KEY": {
+        "description": "Brave Search API key for web search",
+        "prompt": "Brave Search API key",
+        "url": "https://api.search.brave.com/",
+        "tools": ["web_search"],
+        "password": True,
+        "category": "tool",
+    },
     "EXA_API_KEY": {
         "description": "Exa API key for AI-native web search and contents",
         "prompt": "Exa API key",
@@ -4438,6 +4446,7 @@ def show_config():
     keys = [
         ("OPENROUTER_API_KEY", "OpenRouter"),
         ("VOICE_TOOLS_OPENAI_KEY", "OpenAI (STT/TTS)"),
+        ("BRAVE_SEARCH_API_KEY", "Brave Search"),
         ("EXA_API_KEY", "Exa"),
         ("PARALLEL_API_KEY", "Parallel"),
         ("FIRECRAWL_API_KEY", "Firecrawl"),
@@ -4624,7 +4633,7 @@ def set_config_value(key: str, value: str):
     # Check if it's an API key (goes to .env)
     api_keys = [
         'OPENROUTER_API_KEY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'VOICE_TOOLS_OPENAI_KEY',
-        'EXA_API_KEY', 'PARALLEL_API_KEY', 'FIRECRAWL_API_KEY', 'FIRECRAWL_API_URL',
+        'BRAVE_SEARCH_API_KEY', 'EXA_API_KEY', 'PARALLEL_API_KEY', 'FIRECRAWL_API_KEY', 'FIRECRAWL_API_URL',
         'FIRECRAWL_GATEWAY_URL', 'TOOL_GATEWAY_DOMAIN', 'TOOL_GATEWAY_SCHEME',
         'TOOL_GATEWAY_USER_TOKEN', 'TAVILY_API_KEY',
         'BROWSERBASE_API_KEY', 'BROWSERBASE_PROJECT_ID', 'BROWSER_USE_API_KEY',

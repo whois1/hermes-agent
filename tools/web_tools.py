@@ -13,6 +13,7 @@ Available tools:
 - web_crawl_tool: Crawl websites with specific instructions
 
 Backend compatibility:
+- Brave Search: https://api.search.brave.com (search, basic direct-page extract)
 - Exa: https://exa.ai (search, extract)
 - Firecrawl: https://docs.firecrawl.dev/introduction (search, extract, crawl; direct or derived firecrawl-gateway.<domain> for Nous Subscribers)
 - Parallel: https://docs.parallel.ai (search, extract)
@@ -45,6 +46,7 @@ import logging
 import os
 import re
 import asyncio
+from html.parser import HTMLParser
 from typing import List, Dict, Any, Optional, TYPE_CHECKING
 import httpx
 # NOTE: `from firecrawl import Firecrawl` is deliberately NOT at module top —
@@ -126,13 +128,14 @@ def _get_backend() -> str:
     keys manually without running setup.
     """
     configured = (_load_web_config().get("backend") or "").lower().strip()
-    if configured in ("parallel", "firecrawl", "tavily", "exa"):
+    if configured in ("brave", "parallel", "firecrawl", "tavily", "exa"):
         return configured
 
     # Fallback for manual / legacy config — pick the highest-priority
     # available backend. Firecrawl also counts as available when the managed
     # tool gateway is configured for Nous subscribers.
     backend_candidates = (
+        ("brave", _has_env("BRAVE_SEARCH_API_KEY")),
         ("firecrawl", _has_env("FIRECRAWL_API_KEY") or _has_env("FIRECRAWL_API_URL") or _is_tool_gateway_ready()),
         ("parallel", _has_env("PARALLEL_API_KEY")),
         ("tavily", _has_env("TAVILY_API_KEY")),
@@ -147,6 +150,8 @@ def _get_backend() -> str:
 
 def _is_backend_available(backend: str) -> bool:
     """Return True when the selected backend is currently usable."""
+    if backend == "brave":
+        return _has_env("BRAVE_SEARCH_API_KEY")
     if backend == "exa":
         return _has_env("EXA_API_KEY")
     if backend == "parallel":
@@ -222,6 +227,7 @@ def _firecrawl_backend_help_suffix() -> str:
 def _web_requires_env() -> list[str]:
     """Return tool metadata env vars for the currently enabled web backends."""
     requires = [
+        "BRAVE_SEARCH_API_KEY",
         "EXA_API_KEY",
         "PARALLEL_API_KEY",
         "TAVILY_API_KEY",
@@ -399,6 +405,145 @@ def _normalize_tavily_documents(response: dict, fallback_url: str = "") -> List[
             "metadata": {"sourceURL": url_str},
         })
     return documents
+
+
+_BRAVE_BASE_URL = os.getenv("BRAVE_SEARCH_BASE_URL", "https://api.search.brave.com/res/v1")
+
+
+def _brave_request(endpoint: str, params: dict) -> dict:
+    """Send a GET request to the Brave Search API."""
+    api_key = os.getenv("BRAVE_SEARCH_API_KEY", "").strip()
+    if not api_key:
+        raise ValueError(
+            "BRAVE_SEARCH_API_KEY environment variable not set. "
+            "Get your API key at https://api.search.brave.com/"
+        )
+    url = f"{_BRAVE_BASE_URL.rstrip('/')}/{endpoint.lstrip('/')}"
+    headers = {
+        "Accept": "application/json",
+        "X-Subscription-Token": api_key,
+    }
+    response = httpx.get(url, headers=headers, params=params, timeout=60)
+    response.raise_for_status()
+    return response.json()
+
+
+def _normalize_brave_search_results(response: dict) -> dict:
+    """Normalize Brave /web/search response to the standard web search format."""
+    web_results = []
+    for i, result in enumerate((response.get("web") or {}).get("results", [])):
+        web_results.append({
+            "title": result.get("title", ""),
+            "url": result.get("url", ""),
+            "description": result.get("description", ""),
+            "position": i + 1,
+        })
+    return {"success": True, "data": {"web": web_results}}
+
+
+class _TextHTMLParser(HTMLParser):
+    """Tiny dependency-free HTML-to-text extractor for basic web_extract fallback."""
+
+    _skip_tags = {"script", "style", "noscript", "svg", "canvas"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.title = ""
+        self._in_title = False
+        self._skip_depth = 0
+        self._parts: List[str] = []
+
+    def handle_starttag(self, tag, attrs):
+        tag = tag.lower()
+        if tag in self._skip_tags:
+            self._skip_depth += 1
+        if tag == "title":
+            self._in_title = True
+        if tag in {"p", "br", "div", "section", "article", "li", "h1", "h2", "h3"}:
+            self._parts.append("\n")
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+        if tag in self._skip_tags and self._skip_depth:
+            self._skip_depth -= 1
+        if tag == "title":
+            self._in_title = False
+        if tag in {"p", "div", "section", "article", "li"}:
+            self._parts.append("\n")
+
+    def handle_data(self, data):
+        text = data.strip()
+        if not text:
+            return
+        if self._in_title:
+            self.title = (self.title + " " + text).strip()
+        if not self._skip_depth and not self._in_title:
+            self._parts.append(text + " ")
+
+    def text(self) -> str:
+        text = "".join(self._parts)
+        text = re.sub(r"[ \t]+", " ", text)
+        text = re.sub(r"\n\s*\n+", "\n\n", text)
+        return text.strip()
+
+
+def _brave_extract(urls: List[str], format: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Basic direct-page extraction for Brave backend users.
+
+    Brave only provides search results, not content extraction. This lightweight
+    fallback fetches the URL directly and strips HTML so web_extract remains
+    functional for ordinary public pages. For heavy JS/protected pages, use the
+    browser tools or a scraping backend such as Firecrawl/Tavily.
+    """
+    results: List[Dict[str, Any]] = []
+    headers = {"User-Agent": "HermesAgent/1.0 (+https://github.com/NousResearch/hermes-agent)"}
+    for url in urls:
+        blocked = check_website_access(url)
+        if blocked:
+            results.append({
+                "url": url, "title": "", "content": "", "raw_content": "",
+                "error": blocked["message"],
+                "blocked_by_policy": {"host": blocked["host"], "rule": blocked["rule"], "source": blocked["source"]},
+            })
+            continue
+        try:
+            response = httpx.get(url, headers=headers, follow_redirects=True, timeout=30)
+            response.raise_for_status()
+            final_url = str(response.url)
+            final_blocked = check_website_access(final_url)
+            if final_blocked:
+                results.append({
+                    "url": final_url, "title": "", "content": "", "raw_content": "",
+                    "error": final_blocked["message"],
+                    "blocked_by_policy": {"host": final_blocked["host"], "rule": final_blocked["rule"], "source": final_blocked["source"]},
+                })
+                continue
+            content_type = response.headers.get("content-type", "")
+            raw = response.text
+            title = ""
+            content = raw
+            if "html" in content_type.lower() or raw.lstrip().startswith(("<!DOCTYPE", "<html", "<HTML")):
+                parser = _TextHTMLParser()
+                parser.feed(raw)
+                title = parser.title
+                content = raw if format == "html" else parser.text()
+            results.append({
+                "url": final_url,
+                "title": title,
+                "content": content,
+                "raw_content": content,
+                "metadata": {"sourceURL": final_url, "title": title},
+            })
+        except Exception as exc:
+            results.append({
+                "url": url,
+                "title": "",
+                "content": "",
+                "raw_content": "",
+                "error": f"Basic extraction failed: {exc}",
+                "metadata": {"sourceURL": url},
+            })
+    return results
 
 
 def _to_plain_object(value: Any) -> Any:
@@ -1131,6 +1276,20 @@ def web_search_tool(query: str, limit: int = 5) -> str:
 
         # Dispatch to the configured backend
         backend = _get_backend()
+        if backend == "brave":
+            logger.info("Brave search: '%s' (limit: %d)", query, limit)
+            raw = _brave_request("web/search", {
+                "q": query,
+                "count": min(limit, 20),
+            })
+            response_data = _normalize_brave_search_results(raw)
+            debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
+            result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
+            debug_call_data["final_response_size"] = len(result_json)
+            _debug.log_call("web_search_tool", debug_call_data)
+            _debug.save()
+            return result_json
+
         if backend == "parallel":
             response_data = _parallel_search(query, limit)
             debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
@@ -1288,7 +1447,9 @@ async def web_extract_tool(
         else:
             backend = _get_backend()
 
-            if backend == "parallel":
+            if backend == "brave":
+                results = _brave_extract(safe_urls, format=format)
+            elif backend == "parallel":
                 results = await _parallel_extract(safe_urls)
             elif backend == "exa":
                 results = _exa_extract(safe_urls)
