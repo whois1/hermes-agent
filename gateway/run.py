@@ -2023,6 +2023,43 @@ class GatewayRunner:
         return ""
 
     @staticmethod
+    def _reasoning_trigger_matches(text: str, terms: tuple[str, ...]) -> bool:
+        """Return True when any trigger term appears as a word/phrase.
+
+        Avoid substring false positives such as ``fix`` inside ``prefix`` while
+        still allowing phrase triggers such as ``git reset`` or ``set up``.
+        """
+        import re
+
+        haystack = str(text or "").lower()
+        for raw_term in terms:
+            term = str(raw_term or "").strip().lower()
+            if not term:
+                continue
+            pattern = re.escape(term).replace(r"\ ", r"\s+")
+            if re.search(rf"(?<![\w-]){pattern}(?![\w-])", haystack):
+                return True
+        return False
+
+    @staticmethod
+    def _strip_leading_reasoning_effort_labels(text: str) -> str:
+        """Remove model-written leading effort labels so gateway owns the label.
+
+        The gateway knows the actual provider effort selected for the turn.
+        If the model also starts its answer with ``🧠 medium`` etc., strip it
+        before prepending the gateway-selected label to avoid duplicate or
+        conflicting visible levels.
+        """
+        import re
+
+        value = str(text or "")
+        label_re = re.compile(
+            r"^(?:\s*(?:🧠|:brain:)\s*(?:none|minimal|low|medium|high|xhigh)\s*(?:\r?\n|$))+\s*",
+            re.IGNORECASE,
+        )
+        return label_re.sub("", value, count=1)
+
+    @staticmethod
     def _auto_reasoning_for_message(message: str) -> tuple[dict, str | None]:
         """Classify a gateway message into a practical reasoning effort.
 
@@ -2032,21 +2069,23 @@ class GatewayRunner:
         """
         text = str(message or "").lower()
         high_terms = (
-            "code", "bug", "fix", "patch", "implement", "refactor", "test", "tests",
-            "gateway", "cron", "auth", "security", "secret", "token", "password",
-            "migration", "migrate", "rollback", "production", "destructive", "delete",
-            "rm -rf", "hard reset", "git reset", "deploy", "incident",
+            "code", "bug", "fix", "fixing", "fixed", "patch", "implement",
+            "refactor", "test", "tests", "gateway", "cron", "auth", "security",
+            "secret", "token", "password", "migration", "migrate", "rollback",
+            "production", "destructive", "delete", "rm -rf", "hard reset",
+            "git reset", "deploy", "incident",
         )
         medium_terms = (
             "investigate", "debug", "diagnose", "analyse", "analyze", "compare",
             "tradeoff", "trade-off", "recommend", "recommendation", "plan",
             "config", "configure", "setup", "set up", "verify", "check things",
-            "correctly", "sync", "wiki", "zendesk", "linear", "multi-step", "why",
+            "correctly", "sync", "wiki", "zendesk", "linear", "multi-step",
+            "why", "thought", "thoughts", "suggest", "should",
         )
-        if any(term in text for term in high_terms):
+        if GatewayRunner._reasoning_trigger_matches(text, high_terms):
             reasoning_config = {"enabled": True, "effort": "high"}
             return reasoning_config, GatewayRunner._reasoning_effort_notice(reasoning_config)
-        if any(term in text for term in medium_terms):
+        if GatewayRunner._reasoning_trigger_matches(text, medium_terms):
             reasoning_config = {"enabled": True, "effort": "medium"}
             return reasoning_config, GatewayRunner._reasoning_effort_notice(reasoning_config)
         reasoning_config = {"enabled": True, "effort": "low"}
@@ -14031,6 +14070,7 @@ class GatewayRunner:
             # Return final response, or a message if something went wrong
             final_response = result.get("final_response")
             if reasoning_notice and final_response:
+                final_response = self._strip_leading_reasoning_effort_labels(final_response)
                 final_response = f"{reasoning_notice}\n\n{final_response}"
 
             # Extract actual token counts from the agent instance used for this run
