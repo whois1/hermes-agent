@@ -2069,6 +2069,8 @@ class GatewayRunner:
         """
         text = str(message or "").lower()
         high_terms = (
+            "high reasoning", "use high reasoning", "reasoning high", "think hard",
+            "think deeply", "reason deeply", "deep reasoning", "highest reasoning",
             "code", "bug", "fix", "fixing", "fixed", "patch", "implement",
             "refactor", "test", "tests", "gateway", "cron", "auth", "security",
             "secret", "token", "password", "migration", "migrate", "rollback",

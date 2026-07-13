@@ -23,6 +23,11 @@ def test_auto_reasoning_matches_phrases_as_phrases():
     assert _effort("set up the preferences") == "medium"
 
 
+def test_auto_reasoning_honours_natural_language_high_request():
+    assert _effort("use high reasoning and draft a reply") == "high"
+    assert _effort("please think deeply about this") == "high"
+
+
 def test_strip_leading_reasoning_effort_label():
     assert GatewayRunner._strip_leading_reasoning_effort_labels("🧠 medium\n\nBody") == "Body"
     assert GatewayRunner._strip_leading_reasoning_effort_labels("🧠 high\n🧠 medium\n\nBody") == "Body"
