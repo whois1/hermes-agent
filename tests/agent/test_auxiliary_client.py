@@ -2099,6 +2099,76 @@ class TestCodexAdapterStreamRecovery:
         result = adapter.create(messages=[{"role": "user", "content": "name this chat"}])
         assert result.choices[0].message.content == "Hello Title"
 
+    def test_stream_iteration_none_type_recovers_from_text_deltas(self):
+        from agent.auxiliary_client import _CodexCompletionsAdapter
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+
+        class _FakeStream:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def __iter__(self):
+                yield SimpleNamespace(type="response.output_text.delta", delta="Recovered Title")
+                raise TypeError("'NoneType' object is not iterable")
+
+            def get_final_response(self):
+                raise AssertionError("stream iteration should recover before final response")
+
+        real_client = MagicMock()
+        real_client.responses.stream.return_value = _FakeStream()
+        adapter = _CodexCompletionsAdapter(real_client, "gpt-5.5")
+        result = adapter.create(messages=[{"role": "user", "content": "name this chat"}])
+        assert result.choices[0].message.content == "Recovered Title"
+
+    def test_stream_iteration_none_type_without_recoverable_output_raises(self):
+        from agent.auxiliary_client import _CodexCompletionsAdapter
+        from unittest.mock import MagicMock
+        import pytest
+
+        class _FakeStream:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def __iter__(self):
+                raise TypeError("'NoneType' object is not iterable")
+                yield
+
+        real_client = MagicMock()
+        real_client.responses.stream.return_value = _FakeStream()
+        adapter = _CodexCompletionsAdapter(real_client, "gpt-5.5")
+        with pytest.raises(TypeError, match="NoneType"):
+            adapter.create(messages=[{"role": "user", "content": "name this chat"}])
+
+    def test_stream_iteration_none_type_after_partial_function_call_raises(self):
+        from agent.auxiliary_client import _CodexCompletionsAdapter
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+        import pytest
+
+        class _FakeStream:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def __iter__(self):
+                yield SimpleNamespace(type="response.function_call_arguments.delta")
+                raise TypeError("'NoneType' object is not iterable")
+
+        real_client = MagicMock()
+        real_client.responses.stream.return_value = _FakeStream()
+        adapter = _CodexCompletionsAdapter(real_client, "gpt-5.5")
+        with pytest.raises(TypeError, match="NoneType"):
+            adapter.create(messages=[{"role": "user", "content": "call a tool"}])
+
     def test_none_output_iterates_safely(self):
         from agent.auxiliary_client import _CodexCompletionsAdapter
         from types import SimpleNamespace

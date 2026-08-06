@@ -662,28 +662,46 @@ class _CodexCompletionsAdapter:
             collected_text_deltas: List[str] = []
             has_function_calls = False
             with self._client.responses.stream(**resp_kwargs) as stream:
-                for _event in stream:
-                    _etype = getattr(_event, "type", "")
-                    if _etype == "response.output_item.done":
-                        _done = getattr(_event, "item", None)
-                        if _done is not None:
-                            collected_output_items.append(_done)
-                    elif "output_text.delta" in _etype:
-                        _delta = getattr(_event, "delta", "")
-                        if _delta:
-                            collected_text_deltas.append(_delta)
-                    elif "function_call" in _etype:
-                        has_function_calls = True
+                stream_parse_failed = False
                 try:
-                    final = stream.get_final_response()
+                    for _event in stream:
+                        _etype = getattr(_event, "type", "")
+                        if _etype == "response.output_item.done":
+                            _done = getattr(_event, "item", None)
+                            if _done is not None:
+                                collected_output_items.append(_done)
+                        elif "output_text.delta" in _etype:
+                            _delta = getattr(_event, "delta", "")
+                            if _delta:
+                                collected_text_deltas.append(_delta)
+                        elif "function_call" in _etype:
+                            has_function_calls = True
                 except TypeError as exc:
                     if "'NoneType' object is not iterable" not in str(exc):
                         raise
-                    logger.debug(
-                        "Codex auxiliary: get_final_response() parse failure; "
-                        "recovering from streamed events",
+                    recoverable = bool(collected_output_items) or bool(
+                        collected_text_deltas and not has_function_calls
                     )
+                    if not recoverable:
+                        raise
+                    stream_parse_failed = True
+                    logger.debug(
+                        "Codex auxiliary: stream parse failure; recovering from streamed events",
+                    )
+
+                if stream_parse_failed:
                     final = SimpleNamespace(output=[], usage=None)
+                else:
+                    try:
+                        final = stream.get_final_response()
+                    except TypeError as exc:
+                        if "'NoneType' object is not iterable" not in str(exc):
+                            raise
+                        logger.debug(
+                            "Codex auxiliary: get_final_response() parse failure; "
+                            "recovering from streamed events",
+                        )
+                        final = SimpleNamespace(output=[], usage=None)
 
             # Backfill empty/missing output from collected stream events
             _output = getattr(final, "output", None)
