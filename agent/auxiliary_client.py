@@ -674,11 +674,20 @@ class _CodexCompletionsAdapter:
                             collected_text_deltas.append(_delta)
                     elif "function_call" in _etype:
                         has_function_calls = True
-                final = stream.get_final_response()
+                try:
+                    final = stream.get_final_response()
+                except TypeError as exc:
+                    if "'NoneType' object is not iterable" not in str(exc):
+                        raise
+                    logger.debug(
+                        "Codex auxiliary: get_final_response() parse failure; "
+                        "recovering from streamed events",
+                    )
+                    final = SimpleNamespace(output=[], usage=None)
 
-            # Backfill empty output from collected stream events
+            # Backfill empty/missing output from collected stream events
             _output = getattr(final, "output", None)
-            if isinstance(_output, list) and not _output:
+            if not _output:
                 if collected_output_items:
                     final.output = list(collected_output_items)
                     logger.debug(
@@ -708,7 +717,7 @@ class _CodexCompletionsAdapter:
                     val = obj.get(key, default)
                 return val if val is not None else default
 
-            for item in getattr(final, "output", []):
+            for item in (getattr(final, "output", None) or []):
                 item_type = _item_get(item, "type")
                 if item_type == "message":
                     for part in (_item_get(item, "content") or []):

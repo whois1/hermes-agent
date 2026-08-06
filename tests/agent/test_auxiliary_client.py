@@ -2070,3 +2070,55 @@ class TestAnthropicExplicitApiKey:
         assert mock_build.call_args.args[0] == "explicit-fallback-key", (
             "resolve_provider_client must forward explicit_api_key to _try_anthropic()"
         )
+
+
+class TestCodexAdapterStreamRecovery:
+    """Recover from Codex SDK parse failures in auxiliary calls (title gen)."""
+
+    def test_get_final_response_none_type_recovers_from_text_deltas(self):
+        from agent.auxiliary_client import _CodexCompletionsAdapter
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+
+        class _FakeStream:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def __iter__(self):
+                yield SimpleNamespace(type="response.output_text.delta", delta="Hello Title")
+
+            def get_final_response(self):
+                raise TypeError("'NoneType' object is not iterable")
+
+        real_client = MagicMock()
+        real_client.responses.stream.return_value = _FakeStream()
+        adapter = _CodexCompletionsAdapter(real_client, "gpt-5.5")
+        result = adapter.create(messages=[{"role": "user", "content": "name this chat"}])
+        assert result.choices[0].message.content == "Hello Title"
+
+    def test_none_output_iterates_safely(self):
+        from agent.auxiliary_client import _CodexCompletionsAdapter
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+
+        class _FakeStream:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def __iter__(self):
+                return iter([])
+
+            def get_final_response(self):
+                return SimpleNamespace(output=None, usage=None)
+
+        real_client = MagicMock()
+        real_client.responses.stream.return_value = _FakeStream()
+        adapter = _CodexCompletionsAdapter(real_client, "gpt-5.5")
+        result = adapter.create(messages=[{"role": "user", "content": "hi"}])
+        assert result.choices[0].message.content is None

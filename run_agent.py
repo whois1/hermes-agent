@@ -5915,6 +5915,40 @@ class AIAgent:
         # returns empty output (e.g. chatgpt.com backend-api sends
         # response.incomplete instead of response.completed).
         self._codex_streamed_text_parts: list = []
+        def _recover_codex_stream_response(collected_output_items: list, *, reason: str):
+            if collected_output_items:
+                logger.debug(
+                    "Codex stream: recovered %d output items after %s",
+                    len(collected_output_items),
+                    reason,
+                )
+                return SimpleNamespace(
+                    output=list(collected_output_items),
+                    status="completed",
+                    model=self.model,
+                    usage=None,
+                )
+            if self._codex_streamed_text_parts and not has_tool_calls:
+                assembled = "".join(self._codex_streamed_text_parts)
+                logger.debug(
+                    "Codex stream: recovered text from %d deltas after %s (%d chars)",
+                    len(self._codex_streamed_text_parts),
+                    reason,
+                    len(assembled),
+                )
+                return SimpleNamespace(
+                    output=[SimpleNamespace(
+                        type="message",
+                        role="assistant",
+                        status="completed",
+                        content=[SimpleNamespace(type="output_text", text=assembled)],
+                    )],
+                    status="completed",
+                    model=self.model,
+                    usage=None,
+                )
+            return None
+
         for attempt in range(max_stream_retries + 1):
             if self._interrupt_requested:
                 raise InterruptedError("Agent interrupted before Codex stream retry")
@@ -5968,7 +6002,17 @@ class AIAgent:
                                 sum(len(p) for p in self._codex_streamed_text_parts),
                                 self._client_log_context(),
                             )
-                    final_response = stream.get_final_response()
+                    try:
+                        final_response = stream.get_final_response()
+                    except TypeError as exc:
+                        if "'NoneType' object is not iterable" in str(exc):
+                            recovered = _recover_codex_stream_response(
+                                collected_output_items,
+                                reason="SDK final-response parse failure",
+                            )
+                            if recovered is not None:
+                                return recovered
+                        raise
                     # PATCH: ChatGPT Codex backend streams valid output items
                     # but get_final_response() can return an empty output list.
                     # Backfill from collected items or synthesize from deltas.
@@ -5993,6 +6037,15 @@ class AIAgent:
                                 len(self._codex_streamed_text_parts), len(assembled),
                             )
                     return final_response
+            except TypeError as exc:
+                if "'NoneType' object is not iterable" in str(exc):
+                    recovered = _recover_codex_stream_response(
+                        collected_output_items,
+                        reason="SDK stream parse failure",
+                    )
+                    if recovered is not None:
+                        return recovered
+                raise
             except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
                 if attempt < max_stream_retries:
                     logger.debug(
