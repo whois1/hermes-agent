@@ -4341,10 +4341,11 @@ class TurnRunner:
             }
 
         pr = self._runner._provider_routing
-        reasoning_config = self._runner._resolve_session_reasoning_config(
+        reasoning_config, reasoning_label = self._runner._resolve_gateway_turn_reasoning(
             source=ctx.source,
             session_key=ctx.session_key,
             model=model,
+            message=ctx.message,
         )
         self._runner._reasoning_config = reasoning_config
         self._runner._service_tier = self._runner._resolve_session_service_tier(
@@ -4375,7 +4376,10 @@ class TurnRunner:
             if _plat_streaming is None
             else bool(_plat_streaming)
         )
-        _want_stream_deltas = _streaming_enabled
+        # A reasoning label is only authoritative after the turn succeeds.
+        # Use normal final delivery for labelled turns so partial/error streams
+        # cannot expose a success-style label or require post-hoc reconciliation.
+        _want_stream_deltas = _streaming_enabled and not reasoning_label
         _want_interim_messages = ctx.interim_assistant_messages_enabled
         _want_interim_consumer = _want_interim_messages
         if _want_stream_deltas or _want_interim_consumer:
@@ -4402,6 +4406,7 @@ class TurnRunner:
                         on_before_finalize=_pause_typing_before_finalize,
                         initial_reply_to_id=ctx.event_message_id,
                         run_still_current=ctx._run_still_current,
+                        response_prefix="",
                     )
                     if _want_stream_deltas:
                         def _stream_delta_cb(text: str) -> None:
@@ -5327,10 +5332,6 @@ class TurnRunner:
             reset_current_session_key(_approval_session_token)
         ctx.result_holder[0] = result
 
-        # Signal the stream consumer that the agent is done
-        if _stream_consumer is not None:
-            _stream_consumer.finish()
-
         # Signal the streaming-TTS consumer that the agent is done (#60671).
         # finish() is called from the outer event-loop thread after the
         # executor returns, so early returns from run_sync are also
@@ -5459,6 +5460,13 @@ class TurnRunner:
             final_response = _sanitize_gateway_final_response(ctx.source.platform, final_response)
             if not final_response:
                 final_response = f"⚠️ {result['error']}" if result.get("error") else ""
+
+            # Classify and normalize before decorating a deliverable response.
+            final_response = self._runner._label_successful_gateway_response(
+                result, final_response, reasoning_label
+            )
+            if _stream_consumer is not None:
+                _stream_consumer.finish()
             return {
                 "final_response": final_response,
                 "messages": result.get("messages", []),
@@ -5488,6 +5496,12 @@ class TurnRunner:
                 "model": _resolved_model,
                 "context_length": _context_length,
             }
+
+        final_response = self._runner._label_successful_gateway_response(
+            result, final_response, reasoning_label
+        )
+        if _stream_consumer is not None:
+            _stream_consumer.finish()
 
         # Scan tool results for MEDIA:<path> tags that need to be delivered
         # as native audio/file attachments.  The TTS tool embeds MEDIA: tags
@@ -8062,6 +8076,159 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _r_state is not None and _r_state.conversation.reasoning_override is not None:
                 return _r_state.conversation.reasoning_override
         return self._load_reasoning_config(model)
+
+    @staticmethod
+    def _reasoning_effort_notice(reasoning_config: dict | None) -> str | None:
+        """Return a label only when the provider effort is actually known."""
+        if not isinstance(reasoning_config, dict):
+            return None
+        if reasoning_config.get("enabled") is False:
+            return "🧠 none"
+        effort = str(reasoning_config.get("effort") or "").strip().lower()
+        return f"🧠 {effort}" if effort else None
+
+    @staticmethod
+    def _reasoning_trigger_matches(text: str, terms: tuple[str, ...]) -> bool:
+        """Match trigger words or phrases without substring false positives."""
+        import re
+        haystack = str(text or "").lower()
+        for raw_term in terms:
+            term = str(raw_term or "").strip().lower()
+            pattern = re.escape(term).replace(r"\ ", r"\s+")
+            if term and re.search(rf"(?<![\w-]){pattern}(?![\w-])", haystack):
+                return True
+        return False
+
+    @staticmethod
+    def _auto_reasoning_for_message(message: str) -> tuple[dict, str]:
+        """Conservatively classify task intent, retaining low as the default."""
+        import re
+        explicit_high = (
+            "high reasoning", "use high reasoning", "reasoning high", "think hard",
+            "think deeply", "reason deeply", "deep reasoning", "highest reasoning",
+        )
+        text = str(message or "").lower()
+        engineering = re.search(
+            r"\b(?:implement|debug|fix|patch|refactor|migrate|rollback|deploy|audit|"
+            r"write|add|modify|review|check)\b"
+            r".{0,80}\b(?:handler|service|application|system|bug|failure|fails?|change|"
+            r"deployment|migration|database|schema|code|python|function|login|"
+            r"authentication|oauth|policy|flow|tests?|script|button|website)\b", text,
+        )
+        risky_config = (
+            re.search(r"\b(?:change|update|edit|configure|rotate|run|enable|disable)\b", text)
+            and re.search(
+                r"\b(?:firewall|sudo|authentication|authorization|security|secrets?|"
+                r"passwords?|access tokens?|ssh|permissions?)\b", text,
+            )
+        )
+        medium_intent = (
+            re.search(r"\b(?:compare|evaluate)\b.{0,80}\b(?:trade-?offs?|options?)\b", text)
+            or re.search(
+                r"\b(?:investigate|diagnose|analyse|analyze)\b.{0,100}"
+                r"\b(?:failing|failure|issue|problem|cause|why)\b", text,
+            )
+            or re.search(
+                r"\b(?:recommend|draft|create)\b.{0,80}"
+                r"\b(?:plan|strategy|architecture)\b", text,
+            )
+            or re.search(
+                r"\bset\s+up\b.{0,100}\b(?:production|deployment|monitoring|backups?)\b",
+                text,
+            )
+            or re.search(r"\bplan\b.{0,80}\b(?:multi-region|rollout)\b", text)
+            or re.search(
+                r"\btroubleshoot\b.{0,100}\b(?:network|connectivity|services?)\b",
+                text,
+            )
+            or re.search(
+                r"\brestart\b.{0,100}\bservices?\b.{0,80}\b(?:verify|check)\b.{0,40}\bhealth\b",
+                text,
+            )
+            or re.search(r"\b(?:help\s+me\s+)?set\s+up\b.{0,100}\bintegration\b", text)
+        )
+        if GatewayRunner._reasoning_trigger_matches(message, explicit_high) or engineering or risky_config:
+            config = {"enabled": True, "effort": "high"}
+        elif medium_intent:
+            config = {"enabled": True, "effort": "medium"}
+        else:
+            config = {"enabled": True, "effort": "low"}
+        return config, GatewayRunner._reasoning_effort_notice(config)
+
+    @staticmethod
+    def _strip_leading_reasoning_effort_labels(text: str) -> str:
+        """Strip model-written leading labels so the gateway owns the label."""
+        import re
+        return re.sub(
+            r"^(?:\s*(?:🧠|:brain:)\s*(?:none|minimal|low|medium|high|xhigh|max|ultra)"
+            r"\s*(?:\r?\n|$))+\s*", "", str(text or ""), count=1,
+            flags=re.IGNORECASE,
+        )
+
+    @staticmethod
+    def _prepend_reasoning_effort_label(text: str, label: str | None) -> str:
+        """Prepend exactly one selected label, without exposing hidden thinking."""
+        if not label or not text:
+            return text
+        body = GatewayRunner._strip_leading_reasoning_effort_labels(text)
+        return f"{label}\n\n{body}"
+
+    @staticmethod
+    def _label_successful_gateway_response(
+        agent_result: dict, text: str, label: str | None,
+    ) -> str:
+        """Apply the authoritative label only to a successful deliverable."""
+        if not text or not label or not isinstance(agent_result, dict):
+            return text
+        if _is_gateway_hidden_reasoning_incomplete_turn(agent_result):
+            return text
+        if (
+            agent_result.get("failed")
+            or agent_result.get("partial")
+            or agent_result.get("interrupted")
+            or agent_result.get("error")
+            or agent_result.get("completed") is False
+        ):
+            return text
+        return GatewayRunner._prepend_reasoning_effort_label(text, label)
+
+    def _resolve_gateway_turn_reasoning(
+        self, *, session_key: str = "", source: Optional[SessionSource] = None,
+        model: str = "", message: str = "",
+    ) -> tuple[dict | None, str | None]:
+        """Resolve override/config precedence and the gateway-only auto policy."""
+        if session_key:
+            state = self._peek_session_state(session_key)
+            if state is not None and state.conversation.reasoning_override is not None:
+                override = state.conversation.reasoning_override
+                return override, self._reasoning_effort_notice(override)
+        cfg: dict = {}
+        per_model = None
+        try:
+            # This loader follows the active HERMES_HOME/profile context and
+            # shares the canonical config cache. Do not reopen module-home YAML.
+            cfg = _load_gateway_runtime_config()
+            agent_cfg = cfg.get("agent") or {}
+            from hermes_constants import resolve_per_model_reasoning_effort
+            per_model = resolve_per_model_reasoning_effort(
+                model, agent_cfg.get("reasoning_overrides") or {}
+            )
+            is_auto = per_model is None and str(
+                agent_cfg.get("reasoning_effort") or ""
+            ).strip().lower() == "auto"
+        except (ImportError, AttributeError, TypeError, ValueError, OSError) as exc:
+            logger.debug(
+                "Could not resolve gateway auto-reasoning config for model %s: %s",
+                model or "?", exc, exc_info=True,
+            )
+            is_auto = False
+        if per_model is not None:
+            return per_model, self._reasoning_effort_notice(per_model)
+        if is_auto:
+            return self._auto_reasoning_for_message(message)
+        from hermes_constants import resolve_reasoning_config
+        resolved = resolve_reasoning_config(cfg, model)
+        return resolved, self._reasoning_effort_notice(resolved)
 
     def _set_session_reasoning_override(
         self,

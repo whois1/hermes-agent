@@ -41,6 +41,7 @@ logger = logging.getLogger("gateway.stream_consumer")
 
 # Sentinel to signal the stream is complete
 _DONE = object()
+
 _NEW_SEGMENT = object()
 _COMMENTARY = object()
 
@@ -199,6 +200,7 @@ class GatewayStreamConsumer:
         on_before_finalize: Optional[Callable[[], Any]] = None,
         initial_reply_to_id: Optional[str] = None,
         run_still_current: Optional[Callable[[], bool]] = None,
+        response_prefix: str = "",
     ):
         self.adapter = adapter
         self.chat_id = chat_id
@@ -218,6 +220,10 @@ class GatewayStreamConsumer:
         self._on_before_finalize = on_before_finalize
         self._initial_reply_to_id = initial_reply_to_id
         self._queue: queue.Queue = queue.Queue()
+        # Must precede the first preview: sealed overflow heads cannot safely
+        # be rewritten when finalization later learns the complete response.
+        self._response_prefix = str(response_prefix or "")
+        self._response_prefix_applied = False
         self._accumulated = ""
         self._message_id: Optional[str] = None
         # Wall-clock timestamp (time.monotonic) when ``_message_id`` was
@@ -590,6 +596,17 @@ class GatewayStreamConsumer:
     # consumer sends intermediate edits before that stripping happens.
 
     def _filter_and_accumulate(self, text: str) -> None:
+        """Filter a delta, applying the response prefix at first visible content."""
+        self._filter_and_accumulate_visible(text)
+        if (
+            self._accumulated.strip()
+            and self._response_prefix
+            and not self._response_prefix_applied
+        ):
+            self._accumulated = self._response_prefix + self._accumulated
+            self._response_prefix_applied = True
+
+    def _filter_and_accumulate_visible(self, text: str) -> None:
         """Add a text delta to the accumulated buffer, suppressing think blocks.
 
         Uses a state machine that tracks whether we are inside a
@@ -790,6 +807,7 @@ class GatewayStreamConsumer:
                         if item is _DONE:
                             got_done = True
                             break
+
                         if item is _NEW_SEGMENT:
                             got_segment_break = True
                             break
@@ -824,8 +842,11 @@ class GatewayStreamConsumer:
                     # preview instead of finalizing it, so the marker never
                     # reaches the chat.  Substantive prose that merely mentions
                     # a marker is NOT suppressed (see is_intentional_silence_response).
+                    silence_candidate = self._accumulated
+                    if self._response_prefix and silence_candidate.startswith(self._response_prefix):
+                        silence_candidate = silence_candidate[len(self._response_prefix):]
                     if _is_intentional_silence_response(
-                        self._clean_for_display(self._accumulated)
+                        self._clean_for_display(silence_candidate)
                     ):
                         await self._suppress_silence_marker()
                         return
@@ -863,9 +884,11 @@ class GatewayStreamConsumer:
                     and not got_done
                     and not got_segment_break
                     and commentary_text is None
-                    and _is_partial_silence_marker(
-                        self._clean_for_display(self._accumulated)
-                    )
+                    and _is_partial_silence_marker(self._clean_for_display(
+                        self._accumulated[len(self._response_prefix):]
+                        if self._response_prefix and self._accumulated.startswith(self._response_prefix)
+                        else self._accumulated
+                    ))
                 ):
                     should_edit = False
                 if should_edit and self._accumulated:

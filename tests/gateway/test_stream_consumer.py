@@ -9,6 +9,49 @@ import pytest
 from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
 
 
+@pytest.mark.asyncio
+async def test_response_prefix_is_streamed_and_records_delivery():
+    """Decoration is present in the first preview, not inserted post hoc."""
+    adapter = MagicMock()
+    adapter.REQUIRES_EDIT_FINALIZE = False
+    adapter.MAX_MESSAGE_LENGTH = 4096
+    adapter.send = AsyncMock(return_value=SimpleNamespace(success=True, message_id="m1"))
+    adapter.edit_message = AsyncMock(return_value=SimpleNamespace(success=True, message_id="m1"))
+    consumer = GatewayStreamConsumer(adapter, "chat", response_prefix="🧠 high\n\n")
+    task = asyncio.create_task(consumer.run())
+    consumer.on_delta("Answer")
+    consumer.finish()
+    await asyncio.wait_for(task, timeout=2)
+
+    delivered = [call.kwargs.get("content", call.args[-1] if call.args else "")
+                 for call in adapter.send.await_args_list]
+    delivered += [call.kwargs.get("content", call.args[-1] if call.args else "")
+                  for call in adapter.edit_message.await_args_list]
+    assert delivered[-1] == "🧠 high\n\nAnswer"
+    assert consumer.delivered_final_matches("🧠 high\n\nAnswer") is True
+    assert adapter.send.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_response_prefix_is_not_delivered_for_hidden_only_incomplete_stream():
+    """An unfinished hidden reasoning block must not produce a label-only reply."""
+    adapter = MagicMock()
+    adapter.REQUIRES_EDIT_FINALIZE = False
+    adapter.MAX_MESSAGE_LENGTH = 4096
+    adapter.send = AsyncMock(return_value=SimpleNamespace(success=True, message_id="m1"))
+    adapter.edit_message = AsyncMock(return_value=SimpleNamespace(success=True, message_id="m1"))
+    consumer = GatewayStreamConsumer(adapter, "chat", response_prefix="🧠 high\n\n")
+    task = asyncio.create_task(consumer.run())
+    consumer.on_delta("<think>unfinished hidden reasoning")
+    consumer.finish()
+    await asyncio.wait_for(task, timeout=2)
+
+    adapter.send.assert_not_awaited()
+    adapter.edit_message.assert_not_awaited()
+    assert consumer._accumulated == ""
+    assert consumer.final_content_delivered is False
+
+
 def test_stream_send_metadata_carries_original_reply_anchor():
     consumer = GatewayStreamConsumer(
         adapter=MagicMock(),
@@ -1487,4 +1530,49 @@ class TestFlushPendingSync:
 
         consumer.finish()
         await task
+
+
+@pytest.mark.asyncio
+async def test_long_prefixed_stream_seals_labelled_head_and_reconciles_tail():
+    """Overflow never requires an over-limit whole-response replacement."""
+    visible, order = {}, []
+
+    async def send(*args, **kwargs):
+        message_id = f"m{len(order) + 1}"
+        order.append(message_id)
+        visible[message_id] = kwargs["content"]
+        assert len(kwargs["content"]) <= 4096
+        return SimpleNamespace(success=True, message_id=message_id)
+
+    async def edit_message(*args, **kwargs):
+        visible[kwargs["message_id"]] = kwargs["content"]
+        assert len(kwargs["content"]) <= 4096
+        return SimpleNamespace(success=True, message_id=kwargs["message_id"])
+
+    adapter = MagicMock()
+    adapter.REQUIRES_EDIT_FINALIZE = False
+    adapter.MAX_MESSAGE_LENGTH = 4096
+    adapter.send = AsyncMock(side_effect=send)
+    adapter.edit_message = AsyncMock(side_effect=edit_message)
+    adapter.truncate_message = lambda text, limit, len_fn=len: [
+        text[i:i + limit] for i in range(0, len(text), limit)
+    ]
+    body = "0123456789" * 900
+    expected = "🧠 high\n\n" + body
+    consumer = GatewayStreamConsumer(
+        adapter, "chat", StreamConsumerConfig(buffer_threshold=1),
+        response_prefix="🧠 high\n\n",
+    )
+    task = asyncio.create_task(consumer.run())
+    consumer.on_delta(body)
+    consumer.finish()
+    await asyncio.wait_for(task, timeout=2)
+
+    final_visible = "".join(visible[mid] for mid in order)
+    assert len(order) >= 3
+    assert final_visible == expected
+    assert final_visible.count("🧠 high") == 1
+    assert visible[order[0]].startswith("🧠 high\n\n")
+    assert consumer.final_content_delivered is True
+    assert consumer.delivered_final_matches(expected) is None
 
